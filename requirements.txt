@@ -1,0 +1,6 @@
+streamlit
+pandas
+pandas-ta
+plotly
+alpaca-py
+streamlit-autorefresh
