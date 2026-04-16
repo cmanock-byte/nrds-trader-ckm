@@ -4,3 +4,4 @@ pandas-ta
 plotly
 alpaca-py
 streamlit-autorefresh
+pytz
