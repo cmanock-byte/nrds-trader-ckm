@@ -46,7 +46,7 @@ df.set_index('timestamp', inplace=True)
 df.index = df.index.tz_convert('America/New_York')
 
 # --- 4. CALCULATE INDICATORS ---
-# Bollinger Bands (20, 1.5) - TIGHTENED from 2.0 for more frequent scalping signals
+# Bollinger Bands (20, 1.5) - tightened for more frequent scalping signals
 bbands = ta.bbands(df['close'], length=20, std=1.5)
 df = pd.concat([df, bbands], axis=1)
 
@@ -140,10 +140,12 @@ is_blackout_active = BLACKOUT_START <= end_time <= BLACKOUT_END
 # ============================================================
 # TUNING PARAMETERS (Calibrated for NRDS 1-min micro-scalping)
 # ============================================================
-RSI_BUY = 35          # Buy when RSI dips below this (relaxed from 30)
-RSI_SELL = 65         # Sell when RSI rises above this (relaxed from 70)
+RSI_BUY = 35          # Buy when RSI dips below this
+RSI_SELL = 65         # Sell when RSI rises above this
 PROFIT_TARGET = 0.08  # Take profit at +$0.08/share gain
-STOP_LOSS = 0.15      # Cut loss at -$0.15/share loss
+# No hard stop loss - mean reversion needs room to breathe.
+# Risk is managed by: earnings blackout, profit target, RSI/BB
+# exits, max-buy sizing, and paper account calibration.
 # ============================================================
 
 signal = "HOLD"
@@ -167,9 +169,8 @@ else:
     #
     # EXIT (SELL) - OR logic, ANY condition triggers:
     #   1. Profit target hit: up $0.08/share from entry
-    #   2. Stop loss hit: down $0.15/share from entry
-    #   3. RSI(6) rises above 65 (overbought momentum)
-    #   4. Price rises above Upper Bollinger Band (price extreme)
+    #   2. RSI(6) rises above 65 (overbought momentum)
+    #   3. Price rises above Upper Bollinger Band (price extreme)
     # -----------------------------------------------------------
 
     if current_qty == 0 and (rsi_val < RSI_BUY or current_price < lower_bb):
@@ -190,12 +191,7 @@ else:
             signal = "SELL"
             reason = f"💰 PROFIT TARGET HIT: +${pnl_per_share:.2f}/share (target: +${PROFIT_TARGET:.2f})"
 
-        # Exit Priority 2: Stop loss hit
-        elif pnl_per_share <= -STOP_LOSS:
-            signal = "SELL"
-            reason = f"🛑 STOP LOSS HIT: -${abs(pnl_per_share):.2f}/share (limit: -${STOP_LOSS:.2f})"
-
-        # Exit Priority 3: Technical overbought signals
+        # Exit Priority 2: Technical overbought signals
         elif rsi_val > RSI_SELL or current_price > upper_bb:
             signal = "SELL"
             reasons = []
@@ -249,9 +245,9 @@ col3.metric("RSI (6)", f"{rsi_val:.2f}")
 col4.metric("Current Signal", signal)
 st.write(f"**Bot Status:** {reason}")
 
-# Show profit/stop targets when holding a position
+# Show profit target when holding a position
 if current_qty > 0 and entry_price > 0:
-    st.info(f"📍 Entry: ${entry_price:.2f} | 🎯 Profit Target: ${entry_price + PROFIT_TARGET:.2f} | 🛑 Stop Loss: ${entry_price - STOP_LOSS:.2f}")
+    st.info(f"📍 Entry: ${entry_price:.2f} | 🎯 Profit Target: ${entry_price + PROFIT_TARGET:.2f}")
 
 # --- 9. TABS & PLOTLY CHARTS ---
 tab1, tab2, tab3 = st.tabs(["Live Chart (1 Min)", "Challenge Equity Curve", "Trade Log"])
