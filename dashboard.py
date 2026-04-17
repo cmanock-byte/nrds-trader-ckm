@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import pandas_ta as ta
@@ -45,11 +46,11 @@ df.set_index('timestamp', inplace=True)
 df.index = df.index.tz_convert('America/New_York')
 
 # --- 4. CALCULATE INDICATORS ---
-# Bollinger Bands (20, 2) - standard settings
-bbands = ta.bbands(df['close'], length=20, std=2)
+# Bollinger Bands (20, 1.5) - TIGHTENED from 2.0 for more frequent scalping signals
+bbands = ta.bbands(df['close'], length=20, std=1.5)
 df = pd.concat([df, bbands], axis=1)
 
-# RSI (6) - shortened from 10 for faster 1-min scalping signals
+# RSI (6) - short period for fast 1-min scalping signals
 df['RSI_6'] = ta.rsi(df['close'], length=6)
 
 # VWAP
@@ -96,7 +97,6 @@ if not ledger_df.empty:
     holdings = 0
     avg_cost = 0
     realized_pnl = 0
-
     for idx, row in ledger_df.iterrows():
         qty = row["Qty"]
         price = row["Avg Price"]
@@ -110,24 +110,24 @@ if not ledger_df.empty:
             holdings -= qty
             if holdings == 0:
                 avg_cost = 0
-
-        equity_curve.append({
-            "Time": row["Time"],
-            "Equity": 300.00 + realized_pnl
-        })
-
+            equity_curve.append({
+                "Time": row["Time"],
+                "Equity": 300.00 + realized_pnl
+            })
     current_challenge_equity = 300.00 + realized_pnl
 
 equity_df = pd.DataFrame(equity_curve)
 
-# Current Position Check
+# Current Position Check (includes entry price for profit target)
 try:
     position = trading_client.get_open_position('NRDS')
     current_qty = float(position.qty)
     unrealized_pl = float(position.unrealized_pl)
+    entry_price = float(position.avg_entry_price)
 except Exception:
     current_qty = 0
     unrealized_pl = 0.0
+    entry_price = 0.0
 
 # Max-Buy Compounding Logic
 qty_to_buy = int(current_challenge_equity // current_price) if current_price > 0 else 0
@@ -136,6 +136,15 @@ qty_to_buy = int(current_challenge_equity // current_price) if current_price > 0
 BLACKOUT_START = EST.localize(datetime.datetime(2026, 5, 4, 0, 0, 0))
 BLACKOUT_END = EST.localize(datetime.datetime(2026, 5, 13, 23, 59, 59))
 is_blackout_active = BLACKOUT_START <= end_time <= BLACKOUT_END
+
+# ============================================================
+# TUNING PARAMETERS (Calibrated for NRDS 1-min micro-scalping)
+# ============================================================
+RSI_BUY = 35          # Buy when RSI dips below this (relaxed from 30)
+RSI_SELL = 65         # Sell when RSI rises above this (relaxed from 70)
+PROFIT_TARGET = 0.08  # Take profit at +$0.08/share gain
+STOP_LOSS = 0.15      # Cut loss at -$0.15/share loss
+# ============================================================
 
 signal = "HOLD"
 reason = "Awaiting technical triggers."
@@ -150,31 +159,51 @@ if is_blackout_active:
         reason = "Bot paused for earnings. Manual trading enabled."
 else:
     # -----------------------------------------------------------
-    # MEAN REVERSION LOGIC (TUNED FOR 1-MIN BARS)
-    # Buy when EITHER condition fires (OR logic):
-    #   - RSI(6) drops below 30 (oversold momentum)
+    # MEAN REVERSION LOGIC (TUNED FOR 1-MIN SCALPING)
+    #
+    # ENTRY (BUY) - OR logic, either condition triggers:
+    #   - RSI(6) drops below 35 (oversold momentum)
     #   - Price drops below Lower Bollinger Band (price extreme)
-    # Sell when EITHER condition fires (OR logic):
-    #   - RSI(6) rises above 70 (overbought momentum)
-    #   - Price rises above Upper Bollinger Band (price extreme)
+    #
+    # EXIT (SELL) - OR logic, ANY condition triggers:
+    #   1. Profit target hit: up $0.08/share from entry
+    #   2. Stop loss hit: down $0.15/share from entry
+    #   3. RSI(6) rises above 65 (overbought momentum)
+    #   4. Price rises above Upper Bollinger Band (price extreme)
     # -----------------------------------------------------------
-    if current_qty == 0 and (rsi_val < 30 or current_price < lower_bb):
+
+    if current_qty == 0 and (rsi_val < RSI_BUY or current_price < lower_bb):
         signal = "BUY"
         reasons = []
-        if rsi_val < 30:
-            reasons.append(f"RSI ({rsi_val:.2f}) < 30")
+        if rsi_val < RSI_BUY:
+            reasons.append(f"RSI ({rsi_val:.2f}) < {RSI_BUY}")
         if current_price < lower_bb:
             reasons.append(f"Price (${current_price:.2f}) < Lower BB (${lower_bb:.2f})")
         reason = "BUY Signal: " + " | ".join(reasons)
 
-    elif current_qty > 0 and (rsi_val > 70 or current_price > upper_bb):
-        signal = "SELL"
-        reasons = []
-        if rsi_val > 70:
-            reasons.append(f"RSI ({rsi_val:.2f}) > 70")
-        if current_price > upper_bb:
-            reasons.append(f"Price (${current_price:.2f}) > Upper BB (${upper_bb:.2f})")
-        reason = "SELL Signal: " + " | ".join(reasons)
+    elif current_qty > 0:
+        # Calculate per-share P&L from Alpaca's entry price
+        pnl_per_share = current_price - entry_price
+
+        # Exit Priority 1: Profit target hit
+        if pnl_per_share >= PROFIT_TARGET:
+            signal = "SELL"
+            reason = f"💰 PROFIT TARGET HIT: +${pnl_per_share:.2f}/share (target: +${PROFIT_TARGET:.2f})"
+
+        # Exit Priority 2: Stop loss hit
+        elif pnl_per_share <= -STOP_LOSS:
+            signal = "SELL"
+            reason = f"🛑 STOP LOSS HIT: -${abs(pnl_per_share):.2f}/share (limit: -${STOP_LOSS:.2f})"
+
+        # Exit Priority 3: Technical overbought signals
+        elif rsi_val > RSI_SELL or current_price > upper_bb:
+            signal = "SELL"
+            reasons = []
+            if rsi_val > RSI_SELL:
+                reasons.append(f"RSI ({rsi_val:.2f}) > {RSI_SELL}")
+            if current_price > upper_bb:
+                reasons.append(f"Price (${current_price:.2f}) > Upper BB (${upper_bb:.2f})")
+            reason = "SELL Signal: " + " | ".join(reasons)
 
 # --- 7. ORDER EXECUTION ---
 if signal == "BUY" and qty_to_buy > 0:
@@ -199,7 +228,7 @@ elif signal in ["SELL", "SELL_LIQUIDATE"] and current_qty > 0:
             time_in_force=TimeInForce.DAY
         )
         trading_client.submit_order(order_data=sell_order)
-        st.success(f"Executed SELL for {current_qty} shares. {reason}")
+        st.success(f"Executed SELL for {int(current_qty)} shares. {reason}")
     except Exception as e:
         st.error(f"Sell failed: {e}")
 
@@ -208,9 +237,10 @@ st.subheader("🏆 $300 Challenge Metrics")
 colA, colB, colC = st.columns(3)
 colA.metric("Starting Capital", "$300.00")
 colB.metric("Challenge Equity", f"${current_challenge_equity:.2f}", f"${current_challenge_equity - 300.00:.2f} PnL")
-colC.metric("Open Position PnL", f"${unrealized_pl:.2f}", f"{current_qty} Shares")
+colC.metric("Open Position PnL", f"${unrealized_pl:.2f}", f"{int(current_qty)} Shares")
 
 st.markdown("---")
+
 st.subheader("Live Market Signals")
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Current Price", f"${current_price:.2f}")
@@ -218,6 +248,10 @@ col2.metric("Target Buy Qty (Max Buy)", f"{qty_to_buy} Shares")
 col3.metric("RSI (6)", f"{rsi_val:.2f}")
 col4.metric("Current Signal", signal)
 st.write(f"**Bot Status:** {reason}")
+
+# Show profit/stop targets when holding a position
+if current_qty > 0 and entry_price > 0:
+    st.info(f"📍 Entry: ${entry_price:.2f} | 🎯 Profit Target: ${entry_price + PROFIT_TARGET:.2f} | 🛑 Stop Loss: ${entry_price - STOP_LOSS:.2f}")
 
 # --- 9. TABS & PLOTLY CHARTS ---
 tab1, tab2, tab3 = st.tabs(["Live Chart (1 Min)", "Challenge Equity Curve", "Trade Log"])
