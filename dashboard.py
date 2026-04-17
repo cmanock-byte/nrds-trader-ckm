@@ -2,340 +2,377 @@ import streamlit as st
 import pandas as pd
 import pandas_ta as ta
 import plotly.graph_objects as go
+from datetime import datetime, timedelta, date
+import pytz
 import smtplib
-from email.mime.text import MIMEText
-from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+import math
+
+# Alpaca Imports
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+
+# Auto-refresh
 from streamlit_autorefresh import st_autorefresh
 
-# ==========================================
-# 1. SETUP & KEYS (From Streamlit Secrets Vault)
-# ==========================================
-ALPACA_API_KEY = st.secrets["ALPACA_API_KEY"]
-ALPACA_SECRET_KEY = st.secrets["ALPACA_SECRET_KEY"]
-SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
-SENDER_PASSWORD = st.secrets["SENDER_PASSWORD"]
-CELL_PHONE_EMAIL = st.secrets["CELL_PHONE_EMAIL"]
+# ============================================================
+# 1. CONFIG & SECRETS
+# ============================================================
+st.set_page_config(page_title="NRDS $300 Challenge", layout="wide", page_icon="📈")
+st_autorefresh(interval=30000, key="data_refresh")
 
-# Initialize BOTH Alpaca Clients (same keys, two purposes)
-alpaca_data = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-alpaca_trader = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+API_KEY = st.secrets["ALPACA_API_KEY"]
+SECRET_KEY = st.secrets["ALPACA_SECRET_KEY"]
+SENDER_EMAIL = st.secrets.get("SENDER_EMAIL", "")
+SENDER_PASSWORD = st.secrets.get("SENDER_PASSWORD", "")
+RECEIVER_SMS = st.secrets.get("RECEIVER_SMS", "")
 
-# ==========================================
-# 2. CONFIGURATION
-# ==========================================
 SYMBOL = "NRDS"
-TRADE_QTY = 100  # Shares per trade (~$1,080 at current price)
+SEED_CAPITAL = 300.00  # Your $300 challenge starting point
 
-# ==========================================
-# 3. FREE NOTIFICATION FUNCTION
-# ==========================================
-def fire_alerts(title, message_body):
+# ============================================================
+# 2. CLIENT INIT
+# ============================================================
+data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
+
+# ============================================================
+# 3. EMAIL-TO-SMS ALERTING (Free)
+# ============================================================
+def send_sms_alert(subject, body):
+    if not all([SENDER_EMAIL, SENDER_PASSWORD, RECEIVER_SMS]):
+        return
     try:
-        msg = MIMEText(message_body)
-        msg['Subject'] = title
+        msg = EmailMessage()
+        msg.set_content(body)
+        msg['Subject'] = subject
         msg['From'] = SENDER_EMAIL
-        msg['To'] = CELL_PHONE_EMAIL
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.send_message(msg)
+        msg['To'] = RECEIVER_SMS
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
     except Exception as e:
-        st.error(f"Alert Failed: {e}")
+        st.sidebar.error(f"SMS Alert Failed: {e}")
 
-# ==========================================
-# 4. PAPER TRADING FUNCTIONS
-# ==========================================
-def get_position():
-    """Check if we currently hold an NRDS position."""
-    try:
-        position = alpaca_trader.get_open_position(SYMBOL)
-        return position
-    except Exception:
-        return None
-
-def place_buy_order():
-    """Submit a market buy order for NRDS."""
-    try:
-        order_data = MarketOrderRequest(
-            symbol=SYMBOL,
-            qty=TRADE_QTY,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY
-        )
-        order = alpaca_trader.submit_order(order_data=order_data)
-        return order
-    except Exception as e:
-        st.error(f"Buy Order Failed: {e}")
-        return None
-
-def place_sell_order():
-    """Close the entire NRDS position."""
-    try:
-        alpaca_trader.close_position(SYMBOL)
-        return True
-    except Exception as e:
-        st.error(f"Sell Order Failed: {e}")
-        return None
-
-def get_recent_orders():
-    """Get recent NRDS orders for the trade log."""
-    try:
-        request_params = GetOrdersRequest(
-            status=QueryOrderStatus.ALL,
-            limit=10
-        )
-        orders = alpaca_trader.get_orders(filter=request_params)
-        # Filter to only NRDS orders
-        return [o for o in orders if o.symbol == SYMBOL]
-    except Exception:
-        return []
-
-# ==========================================
-# 5. PAGE CONFIG & AUTOREFRESH
-# ==========================================
-st.set_page_config(page_title="NRDS Trader", layout="wide")
-st_autorefresh(interval=30000, key="live_clock")
-
-# ==========================================
-# 6. SIDEBAR SAFEGUARDS
-# ==========================================
-st.sidebar.markdown("### 🛡️ 8-Layer Safeguards")
-st.sidebar.markdown("**Next Earnings:** May 6, 2026")
-earnings_guard = st.sidebar.checkbox("Earnings Blackout Active (May 1 - May 8)")
-circuit_breaker = st.sidebar.checkbox("Circuit Breaker (3 Losses / $50 Down)")
-trend_guard = st.sidebar.checkbox("Trend Guard Active")
-
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🤖 Auto-Trading")
-auto_trade_enabled = st.sidebar.checkbox("Enable Paper Trading", value=True)
-st.sidebar.caption(f"Trade Size: {TRADE_QTY} shares per signal")
-
-if earnings_guard or circuit_breaker:
-    st.error("🚨 TRADING HALTED: A critical safeguard is active.")
-    st.stop()
-
-# ==========================================
-# 7. DATA FETCHING FUNCTION
-# ==========================================
+# ============================================================
+# 4. DATA PIPELINE (IEX Feed)
+# ============================================================
 @st.cache_data(ttl=15)
-def get_nrds_data():
-    now = datetime.now(timezone.utc)
-    start_date = now - timedelta(days=3)
-    request_params = StockBarsRequest(
+def get_data():
+    ny_tz = pytz.timezone('US/Eastern')
+    end_dt = datetime.now(ny_tz)
+    start_dt = end_dt - timedelta(days=3)
+    req = StockBarsRequest(
         symbol_or_symbols=SYMBOL,
         timeframe=TimeFrame.Minute,
-        start=start_date,
-        feed=DataFeed.IEX
+        start=start_dt,
+        end=end_dt,
+        feed="iex"
     )
-    bars = alpaca_data.get_stock_bars(request_params).df
-    if bars.empty:
+    bars = data_client.get_stock_bars(req)
+    if not bars.data or SYMBOL not in bars.data:
         return pd.DataFrame()
-    bars = bars.reset_index(level=0, drop=True)
+    df = bars.df.loc[SYMBOL].reset_index()
+    df.set_index('timestamp', inplace=True)
+    df.index = df.index.tz_convert(ny_tz)
 
-    # Calculate Indicators
-    bars.ta.bbands(length=20, std=2.0, append=True)
-    bars.ta.rsi(length=10, append=True)
-    bars.ta.vwap(append=True)
-
-    # Standardize column names dynamically
-    col_map = {}
-    for col in bars.columns:
-        if col.startswith('BBL_'): col_map[col] = 'lower_bb'
-        elif col.startswith('BBU_'): col_map[col] = 'upper_bb'
-        elif col.startswith('BBM_'): col_map[col] = 'mid_bb'
-        elif col.startswith('BBB_'): col_map[col] = 'bb_bandwidth'
-        elif col.startswith('BBP_'): col_map[col] = 'bb_percent'
-        elif col.startswith('RSI_'): col_map[col] = 'rsi'
-        elif col.startswith('VWAP_'): col_map[col] = 'calc_vwap'
-    bars = bars.rename(columns=col_map)
-
-    # Fix duplicate vwap columns (Alpaca has one, pandas-ta adds another)
-    if 'vwap' in bars.columns and 'calc_vwap' in bars.columns:
-        bars = bars.drop(columns=['vwap'])
-        bars = bars.rename(columns={'calc_vwap': 'vwap'})
-    elif 'calc_vwap' in bars.columns:
-        bars = bars.rename(columns={'calc_vwap': 'vwap'})
-
-    return bars
-
-# ==========================================
-# 8. MAIN DASHBOARD UI
-# ==========================================
-st.title("📈 NRDS Mean Reversion Strategy (Paper Trading)")
-st.caption(f"Last Data Sync: {datetime.now().strftime('%H:%M:%S')} PDT")
-
-try:
-    df = get_nrds_data()
-
-    if df.empty or len(df) < 20:
-        st.warning("Not enough data. Market may be closed.")
-        st.stop()
-
-    # Get latest values (force to float to avoid Series formatting errors)
-    current_price = float(df['close'].iloc[-1])
-    lower_band = float(df['lower_bb'].iloc[-1])
-    upper_band = float(df['upper_bb'].iloc[-1])
-    current_rsi = float(df['rsi'].iloc[-1])
-    current_vwap = float(df['vwap'].iloc[-1])
-
-    st.subheader(f"Current NRDS Price: ${current_price:.2f}")
-
-    # --- SIGNAL LOGIC (unchanged from your original rules) ---
-    signal = "NEUTRAL"
-    signal_detail = "Waiting for a setup."
-
-    if current_price < lower_band and current_rsi < 30 and not trend_guard:
-        signal = "BUY"
-        signal_detail = f"Price ${current_price:.2f} < Lower BB ${lower_band:.2f} AND RSI {current_rsi:.1f} < 30"
-    elif current_price > upper_band and current_rsi > 70 and not trend_guard:
-        signal = "SELL"
-        signal_detail = f"Price ${current_price:.2f} > Upper BB ${upper_band:.2f} AND RSI {current_rsi:.1f} > 70"
-
-    # --- DISPLAY SIGNAL & INDICATORS ---
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("### 🚦 Current Signal")
-        if signal == "BUY":
-            st.success(f"**{signal}** - {signal_detail}")
-        elif signal == "SELL":
-            st.error(f"**{signal}** - {signal_detail}")
-        else:
-            st.info(f"**{signal}** - {signal_detail}")
-
-    with col2:
-        st.markdown("### 📊 Live Indicators")
-        st.write(f"**RSI (10):** {current_rsi:.1f}")
-        st.write(f"**VWAP:** ${current_vwap:.2f}")
-        st.write(f"**Lower Band:** ${lower_band:.2f}")
-        st.write(f"**Upper Band:** ${upper_band:.2f}")
-
-    # ==========================================
-    # 9. AUTO-TRADING ENGINE
-    # ==========================================
-    st.markdown("---")
-    st.markdown("### 🤖 Paper Trading Engine")
-
-    # Check current position
-    position = get_position()
-
-    if position:
-        pos_qty = int(float(position.qty))
-        pos_avg = float(position.avg_entry_price)
-        pos_pnl = float(position.unrealized_pl)
-        pos_pnl_pct = float(position.unrealized_plpc) * 100
-        pnl_color = "green" if pos_pnl >= 0 else "red"
-        st.markdown(
-            f"**Current Position:** {pos_qty} shares @ ${pos_avg:.2f} | "
-            f"P&L: <span style='color:{pnl_color}'>${pos_pnl:.2f} ({pos_pnl_pct:+.2f}%)</span>",
-            unsafe_allow_html=True
-        )
-    else:
-        st.markdown("**Current Position:** No open position (FLAT)")
-
-    # Session state prevents duplicate orders on 30-sec refresh
-    if 'last_signal_acted' not in st.session_state:
-        st.session_state.last_signal_acted = None
-
-    # --- EXECUTE TRADES ---
-    if auto_trade_enabled:
-        trade_executed = False
-
-        # BUY: Signal is BUY + No existing position + Haven't already acted on this BUY
-        if signal == "BUY" and position is None and st.session_state.last_signal_acted != "BUY":
-            order = place_buy_order()
-            if order:
-                st.session_state.last_signal_acted = "BUY"
-                trade_executed = True
-                fire_alerts(
-                    "NRDS AUTO-BUY",
-                    f"Bought {TRADE_QTY} shares of NRDS at ~${current_price:.2f}"
-                )
-                st.success(f"AUTO-BUY: {TRADE_QTY} shares of NRDS at ~${current_price:.2f}")
-
-        # SELL: Signal is SELL + We hold a position + Haven't already acted on this SELL
-        elif signal == "SELL" and position is not None and st.session_state.last_signal_acted != "SELL":
-            result = place_sell_order()
-            if result:
-                st.session_state.last_signal_acted = "SELL"
-                trade_executed = True
-                fire_alerts(
-                    "NRDS AUTO-SELL",
-                    f"Sold NRDS position at ~${current_price:.2f}"
-                )
-                st.success(f"AUTO-SELL: Closed NRDS position at ~${current_price:.2f}")
-
-        # NEUTRAL: Reset the tracker so we can act on the next signal
-        elif signal == "NEUTRAL":
-            st.session_state.last_signal_acted = None
-
-        # Status messages
-        if not trade_executed:
-            if signal == "BUY" and position is not None:
-                st.info("BUY signal active but already holding a position.")
-            elif signal == "SELL" and position is None:
-                st.info("SELL signal active but no position to sell.")
-            elif signal == "NEUTRAL":
-                st.info("Auto-trading ON. Waiting for BUY or SELL signal...")
-    else:
-        st.warning("Auto-trading is OFF. Toggle it on in the sidebar.")
-
-    # ==========================================
-    # 10. RECENT TRADE LOG
-    # ==========================================
-    st.markdown("---")
-    st.markdown("### 📋 Recent Trade Log")
-
-    recent_orders = get_recent_orders()
-    if recent_orders:
-        log_data = []
-        for order in recent_orders:
-            log_data.append({
-                "Time": order.submitted_at.strftime("%m/%d %H:%M") if order.submitted_at else "N/A",
-                "Side": order.side.value.upper(),
-                "Qty": str(order.qty),
-                "Status": order.status.value,
-                "Fill Price": f"${float(order.filled_avg_price):.2f}" if order.filled_avg_price else "Pending",
-            })
-        st.table(pd.DataFrame(log_data))
-    else:
-        st.info("No trades yet. The bot will execute when signals fire!")
-
-    # ==========================================
-    # 11. CHART
-    # ==========================================
-    st.markdown("### 📈 Live Chart")
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['close'],
-        line=dict(color='white', width=1), name='Price'
-    ))
+    # Drop Alpaca's built-in vwap to avoid duplicates
     if 'vwap' in df.columns:
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df['vwap'],
-            line=dict(color='orange', width=2), name='VWAP'
-        ))
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['upper_bb'],
-        line=dict(color='red', width=1, dash='dash'), name='Upper BB'
-    ))
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['lower_bb'],
-        line=dict(color='green', width=1, dash='dash'), name='Lower BB'
-    ))
-    fig.update_layout(
-        xaxis_rangeslider_visible=False,
-        height=500,
-        template='plotly_dark'
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        df = df.drop(columns=['vwap'])
 
-except Exception as e:
-    st.error(f"Error: {e}")
+    # Calculate indicators
+    df.ta.bbands(length=20, std=2, append=True)
+    df.ta.rsi(length=10, append=True)
+    df.ta.vwap(append=True)
+    return df
+
+# ============================================================
+# 5. TRADE HISTORY FROM ALPACA (Persistent across restarts!)
+# ============================================================
+@st.cache_data(ttl=60)
+def get_trade_history():
+    """Pull all filled NRDS orders from Alpaca. This data persists
+    on Alpaca's servers forever - no local storage needed."""
+    try:
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            symbols=[SYMBOL],
+            limit=500
+        )
+        orders = trading_client.get_orders(filter=request)
+        if not orders:
+            return pd.DataFrame()
+
+        rows = []
+        for o in orders:
+            if o.filled_qty and float(o.filled_qty) > 0:
+                rows.append({
+                    'time': o.filled_at,
+                    'side': o.side.value,
+                    'qty': float(o.filled_qty),
+                    'avg_price': float(o.filled_avg_price),
+                    'total': float(o.filled_qty) * float(o.filled_avg_price)
+                })
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df = df.sort_values('time').reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def calculate_challenge_equity(trade_df):
+    """Walk through trade history to reconstruct the $300 challenge
+    balance over time, showing compounding growth."""
+    if trade_df.empty:
+        return pd.DataFrame()
+
+    balance = SEED_CAPITAL
+    shares = 0
+    equity_curve = [{'time': trade_df['time'].iloc[0] - timedelta(hours=1),
+                     'equity': SEED_CAPITAL, 'event': 'Start'}]
+
+    for _, row in trade_df.iterrows():
+        if row['side'] == 'buy':
+            cost = row['qty'] * row['avg_price']
+            # Only count up to what our challenge balance can afford
+            if cost <= balance * 1.01:  # Small tolerance for market fills
+                balance -= cost
+                shares += row['qty']
+                equity_curve.append({
+                    'time': row['time'],
+                    'equity': balance + (shares * row['avg_price']),
+                    'event': f"BUY {int(row['qty'])} @ ${row['avg_price']:.2f}"
+                })
+        elif row['side'] == 'sell':
+            if shares > 0:
+                proceeds = row['qty'] * row['avg_price']
+                shares -= row['qty']
+                balance += proceeds
+                equity_curve.append({
+                    'time': row['time'],
+                    'equity': balance + (shares * row['avg_price']) if shares > 0 else balance,
+                    'event': f"SELL {int(row['qty'])} @ ${row['avg_price']:.2f}"
+                })
+
+    return pd.DataFrame(equity_curve)
+
+# ============================================================
+# 6. SAFEGUARDS
+# ============================================================
+def check_safeguards():
+    ny_time = datetime.now(pytz.timezone('US/Eastern'))
+
+    # Layer 1: Earnings Blackout
+    if ny_time.date() == date(2026, 5, 6):
+        return False, "⚠️ Earnings Blackout Active (May 6, 2026). Trading paused."
+
+    # Layer 2: Market Hours (9:30 AM - 4:00 PM ET)
+    market_open = ny_time.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = ny_time.replace(hour=16, minute=0, second=0, microsecond=0)
+    if not (market_open <= ny_time <= market_close) or ny_time.weekday() > 4:
+        return False, "⏸️ Outside market hours."
+
+    return True, "✅ All safeguards passed. Engine armed."
+
+# ============================================================
+# 7. MAIN DASHBOARD
+# ============================================================
+def main():
+    st.title(f"📈 NRDS $300 Challenge - Max-Buy Compounder")
+
+    df = get_data()
+    if df.empty:
+        st.warning("Awaiting market data from Alpaca IEX feed...")
+        return
+
+    # --- Latest Tick ---
+    latest = df.iloc[-1]
+    current_price = latest['close']
+    rsi_col = [c for c in df.columns if c.startswith('RSI')][0]
+    bbl_col = [c for c in df.columns if c.startswith('BBL')][0]
+    bbu_col = [c for c in df.columns if c.startswith('BBU')][0]
+    vwap_col = [c for c in df.columns if c.startswith('VWAP')][0]
+
+    rsi_val = latest[rsi_col]
+    lower_bb = latest[bbl_col]
+    upper_bb = latest[bbu_col]
+    vwap_val = latest[vwap_col]
+
+    # --- Portfolio State (from Alpaca - persists forever) ---
+    account = trading_client.get_account()
+    cash_available = float(account.cash)
+
+    try:
+        position = trading_client.get_open_position(SYMBOL)
+        held_qty = int(float(position.qty))
+        unrealized_pl = float(position.unrealized_pl)
+        avg_entry = float(position.avg_entry_price)
+    except Exception:
+        position = None
+        held_qty = 0
+        unrealized_pl = 0.0
+        avg_entry = 0.0
+
+    # --- SIDEBAR ---
+    st.sidebar.header("💰 $300 Challenge")
+    # Calculate virtual challenge balance from trade history
+    trade_df = get_trade_history()
+    equity_df = calculate_challenge_equity(trade_df)
+    if not equity_df.empty:
+        current_equity = equity_df['equity'].iloc[-1]
+        gain = current_equity - SEED_CAPITAL
+        gain_pct = (gain / SEED_CAPITAL) * 100
+        st.sidebar.metric("Challenge Equity", f"${current_equity:.2f}",
+                          delta=f"${gain:+.2f} ({gain_pct:+.1f}%)")
+    else:
+        current_equity = SEED_CAPITAL
+        st.sidebar.metric("Challenge Equity", f"${SEED_CAPITAL:.2f}", delta="Waiting for first trade")
+
+    st.sidebar.markdown("---")
+    st.sidebar.header("💼 Alpaca Paper Account")
+    st.sidebar.write(f"**Cash:** ${cash_available:.2f}")
+    st.sidebar.write(f"**{SYMBOL} Held:** {held_qty} shares")
+    if held_qty > 0:
+        pl_color = "green" if unrealized_pl > 0 else "red"
+        st.sidebar.markdown(
+            f"**Entry:** ${avg_entry:.2f} | **P/L:** "
+            f"<span style='color:{pl_color}'>${unrealized_pl:.2f}</span>",
+            unsafe_allow_html=True)
+
+    st.sidebar.markdown("---")
+    is_safe, sys_msg = check_safeguards()
+    st.sidebar.info(sys_msg)
+
+    # --- SIGNAL LOGIC ---
+    signal = "HOLD"
+    if current_price < lower_bb and rsi_val < 30 and current_price < vwap_val:
+        signal = "BUY"
+    elif current_price > upper_bb or rsi_val > 70:
+        signal = "SELL"
+
+    # --- Price & Signal Display ---
+    col_price, col_signal, col_indicators = st.columns([1, 1, 2])
+    with col_price:
+        st.metric("Latest Price", f"${current_price:.2f}")
+    with col_signal:
+        if signal == "BUY":
+            st.success(f"🟢 **BUY SIGNAL**")
+        elif signal == "SELL":
+            st.error(f"🔴 **SELL SIGNAL**")
+        else:
+            st.info(f"⚪ **HOLD** - Waiting")
+    with col_indicators:
+        st.write(f"**RSI:** {rsi_val:.1f} | **VWAP:** ${vwap_val:.2f} | "
+                 f"**BB Low:** ${lower_bb:.2f} | **BB High:** ${upper_bb:.2f}")
+
+    # --- EXECUTION ENGINE ---
+    if "last_trade_time" not in st.session_state:
+        st.session_state.last_trade_time = None
+
+    if is_safe:
+        # BUY: Max shares the $300 challenge can afford
+        if signal == "BUY" and held_qty == 0:
+            # Use the challenge equity (not the full $100k paper account)
+            buy_budget = min(current_equity, cash_available)
+            qty_to_buy = math.floor(buy_budget / current_price)
+
+            if qty_to_buy > 0 and st.session_state.last_trade_time != latest.name:
+                req = MarketOrderRequest(
+                    symbol=SYMBOL,
+                    qty=qty_to_buy,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY
+                )
+                trading_client.submit_order(req)
+                alert_msg = (f"BUY EXECUTED: {qty_to_buy} shares of {SYMBOL} "
+                             f"@ ~${current_price:.2f}. "
+                             f"Cost: ~${(qty_to_buy * current_price):.2f}")
+                st.success(alert_msg)
+                send_sms_alert(f"{SYMBOL} BUY", alert_msg)
+                st.session_state.last_trade_time = latest.name
+
+        # SELL: Liquidate entire position
+        elif signal == "SELL" and held_qty > 0:
+            if st.session_state.last_trade_time != latest.name:
+                req = MarketOrderRequest(
+                    symbol=SYMBOL,
+                    qty=held_qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY
+                )
+                trading_client.submit_order(req)
+                alert_msg = (f"SELL EXECUTED: {held_qty} shares of {SYMBOL} "
+                             f"@ ~${current_price:.2f}. P/L: ${unrealized_pl:.2f}")
+                st.success(alert_msg)
+                send_sms_alert(f"{SYMBOL} SELL", alert_msg)
+                st.session_state.last_trade_time = latest.name
+
+    # --- CHARTS ---
+    # Tab 1: Live Price Chart | Tab 2: $300 Challenge Growth
+    tab1, tab2, tab3 = st.tabs(["📊 Live Chart", "📈 $300 Challenge", "📋 Trade Log"])
+
+    with tab1:
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df['open'], high=df['high'],
+            low=df['low'], close=df['close'], name='Price'))
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df[bbu_col],
+            line=dict(color='gray', width=1, dash='dot'), name='Upper BB'))
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df[bbl_col],
+            line=dict(color='gray', width=1, dash='dot'), name='Lower BB'))
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df[vwap_col],
+            line=dict(color='#ff9900', width=1.5), name='VWAP'))
+        fig.update_layout(
+            title=f"{SYMBOL} Live (1-Min, IEX Feed)",
+            xaxis_title="Time (EST)", yaxis_title="Price ($)",
+            template="plotly_dark", height=500,
+            margin=dict(l=0, r=0, t=40, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with tab2:
+        if not equity_df.empty and len(equity_df) > 1:
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(
+                x=equity_df['time'], y=equity_df['equity'],
+                mode='lines+markers',
+                line=dict(color='#00cc96', width=2),
+                text=equity_df['event'],
+                hovertemplate='%{text}<br>Equity: $%{y:.2f}<extra></extra>',
+                name='Challenge Equity'))
+            fig2.add_hline(y=SEED_CAPITAL,
+                           line_dash="dash", line_color="yellow",
+                           annotation_text="$300 Start")
+            fig2.update_layout(
+                title="$300 Challenge - Growth Over Time",
+                xaxis_title="Date", yaxis_title="Equity ($)",
+                template="plotly_dark", height=400,
+                margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("Your $300 Challenge growth chart will appear here after your first completed trade!")
+
+    with tab3:
+        if not trade_df.empty:
+            display_df = trade_df.copy()
+            display_df['time'] = pd.to_datetime(display_df['time']).dt.strftime('%m/%d %H:%M')
+            display_df['side'] = display_df['side'].str.upper()
+            display_df['avg_price'] = display_df['avg_price'].apply(lambda x: f"${x:.2f}")
+            display_df['total'] = display_df['total'].apply(lambda x: f"${x:.2f}")
+            display_df.columns = ['Time', 'Side', 'Shares', 'Fill Price', 'Total']
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No trades yet. Your full trade log will appear here after the bot executes its first order!")
+
+if __name__ == "__main__":
+    main()
