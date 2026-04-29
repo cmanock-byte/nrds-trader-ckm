@@ -414,12 +414,29 @@ for symbol, config in TICKERS.items():
 
 # ================================================================
 # 8. ORDER EXECUTION - SPLIT CAPITAL
+#
+# GUARD: Before submitting ANY order, check Alpaca for open/pending
+# orders on that symbol. If one exists, skip to avoid duplicates.
 # ================================================================
+
+# Check for any open/pending orders to prevent duplicate submissions
+try:
+    open_orders_req = GetOrdersRequest(
+        status=QueryOrderStatus.OPEN,
+        symbols=all_symbols
+    )
+    open_orders = trading_client.get_orders(filter=open_orders_req)
+    pending_symbols = {o.symbol for o in open_orders}
+except Exception:
+    pending_symbols = set()
 
 # --- SELL EXECUTION ---
 # Earnings blackout: liquidate everything
 for symbol, sig_data in signals.items():
     if sig_data["signal"] == "SELL_LIQUIDATE" and current_ticker == symbol and total_qty > 0:
+        if symbol in pending_symbols:
+            st.warning(f"⏳ Sell already pending for {symbol}. Waiting for fill...")
+            continue
         try:
             sell_order = MarketOrderRequest(
                 symbol=symbol,
@@ -435,40 +452,48 @@ for symbol, sig_data in signals.items():
 
 # Patient slot sell
 if patient_sell and current_ticker and patient_qty > 0:
-    try:
-        sell_order = MarketOrderRequest(
-            symbol=current_ticker,
-            qty=patient_qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-            client_order_id=f"PAT_{uuid.uuid4().hex[:8]}"
-        )
-        trading_client.submit_order(order_data=sell_order)
-        st.success(f"✅ PATIENT SELL: {int(patient_qty)} shares of **{current_ticker}**. {patient_sell_reason}")
-    except Exception as e:
-        st.error(f"Patient sell failed: {e}")
+    if current_ticker in pending_symbols:
+        st.warning(f"⏳ Order already pending for {current_ticker}. Waiting for fill...")
+    else:
+        try:
+            sell_order = MarketOrderRequest(
+                symbol=current_ticker,
+                qty=patient_qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                client_order_id=f"PAT_{uuid.uuid4().hex[:8]}"
+            )
+            trading_client.submit_order(order_data=sell_order)
+            st.success(f"✅ PATIENT SELL: {int(patient_qty)} shares of **{current_ticker}**. {patient_sell_reason}")
+        except Exception as e:
+            st.error(f"Patient sell failed: {e}")
 
 # Active slot sell
 if active_sell and current_ticker and active_qty > 0:
-    try:
-        sell_order = MarketOrderRequest(
-            symbol=current_ticker,
-            qty=active_qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
-            client_order_id=f"ACT_{uuid.uuid4().hex[:8]}"
-        )
-        trading_client.submit_order(order_data=sell_order)
-        st.success(f"✅ ACTIVE SELL: {int(active_qty)} shares of **{current_ticker}**. {active_sell_reason}")
-    except Exception as e:
-        st.error(f"Active sell failed: {e}")
+    if current_ticker in pending_symbols:
+        st.warning(f"⏳ Order already pending for {current_ticker}. Waiting for fill...")
+    else:
+        try:
+            sell_order = MarketOrderRequest(
+                symbol=current_ticker,
+                qty=active_qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                client_order_id=f"ACT_{uuid.uuid4().hex[:8]}"
+            )
+            trading_client.submit_order(order_data=sell_order)
+            st.success(f"✅ ACTIVE SELL: {int(active_qty)} shares of **{current_ticker}**. {active_sell_reason}")
+        except Exception as e:
+            st.error(f"Active sell failed: {e}")
 
 # --- BUY EXECUTION ---
 if buy_candidate:
     symbol, buy_type = buy_candidate
     price = ticker_data[symbol]["current_price"]
 
-    if buy_type == "BUY":
+    if symbol in pending_symbols:
+        st.warning(f"⏳ Order already pending for {symbol}. Waiting for fill...")
+    elif buy_type == "BUY":
         # Both slots empty -> split capital 50/50
         half_capital = current_challenge_equity / 2.0
         patient_buy_qty = int(half_capital // price) if price > 0 else 0
