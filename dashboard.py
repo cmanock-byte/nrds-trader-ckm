@@ -500,7 +500,9 @@ if market_is_open() and not PAUSED:
 st.subheader("Portfolio Overview")
 colA, colB, colC, colD = st.columns(4)
 colA.metric("Starting Capital", f"${SEED_CAPITAL:.2f}")
-colB.metric("Challenge Equity", f"${current_challenge_equity:.2f}", f"${current_challenge_equity - SEED_CAPITAL:.2f} PnL")
+_pnl = current_challenge_equity - SEED_CAPITAL
+_pnl_label = f"-${abs(_pnl):.2f} PnL" if _pnl < 0 else f"${_pnl:.2f} PnL"
+colB.metric("Challenge Equity", f"${current_challenge_equity:.2f}", _pnl_label)
 if current_ticker:
     colC.metric("Holding", f"{current_ticker}", f"{int(total_qty)} Shares")
     colD.metric("Open PnL", f"${unrealized_pl:.2f}")
