@@ -195,7 +195,22 @@ if not ledger_df.empty:
     ledger_df = ledger_df.sort_values("Time").reset_index(drop=True)
 current_challenge_equity = SEED_CAPITAL + realized_pnl
 equity_df = pd.DataFrame(equity_curve)
+# ================================================================
+# REAL EQUITY OVERRIDE
+# Bypass reconstructed PnL - use Alpaca's actual account data
+# This prevents fake equity display AND prevents over-buying errors
+# ================================================================
+try:
+    alpaca_account = trading_client.get_account()
+    current_challenge_equity = float(alpaca_account.portfolio_value)
+    actual_buying_power = float(alpaca_account.buying_power)
+    deployed_cost = current_challenge_equity - actual_buying_power
+except Exception as e:
+    st.warning(f"Could not fetch live account data: {e}")
+    actual_buying_power = current_challenge_equity - deployed_cost
 
+realized_pnl = current_challenge_equity - SEED_CAPITAL
+remaining_budget = actual_buying_power * BUDGET_SAFETY_FACTOR
 # ================================================================
 # SECTION 6 - DETERMINE CURRENT POSITION (TWO-LAYER CHECK)
 #
