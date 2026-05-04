@@ -348,15 +348,6 @@ for symbol, config in TICKERS.items():
 
 # ================================================================
 # SECTION 8 - ORDER EXECUTION (TRIPLE-GUARDED + MARKET HOURS)
-#
-# GUARD 0: Market hours gate - no orders outside 9:30am-4pm ET
-# GUARD 1: 60-second cooldown (local session memory)
-# GUARD 2: Pending order check (open orders query)
-# GUARD 3: Strict capital budget (NEVER exceed challenge equity)
-#
-# BUDGET_SAFETY_FACTOR = 0.95 ensures price movement between
-# signal detection and order fill never trips Alpaca's buying
-# power check (fixes "insufficient buying power" error).
 # ================================================================
 
 BUDGET_SAFETY_FACTOR = 0.95
@@ -382,54 +373,60 @@ if buy_candidate and remaining_budget <= 0:
     st.error(f"CAPITAL LIMIT: ${deployed_cost:.2f} deployed of ${current_challenge_equity:.2f}. No budget for new buys.")
     buy_candidate = None
 
-# Show cooldown or market closed status
-if not market_is_open():
+# SAFETY: Get actual Alpaca position before any sell
+# Prevents "not allowed to short" by never selling more than actually held
+actual_held_qty = 0
+if current_ticker:
+    try:
+        actual_pos = trading_client.get_open_position(current_ticker)
+        actual_held_qty = float(actual_pos.qty)
+    except Exception:
+        actual_held_qty = 0
+
+# Show status
+if PAUSED:
+    st.error("BOT PAUSED - Flip the toggle to resume.")
+elif not market_is_open():
     st.info("Market closed. Bot is monitoring only - no orders will be submitted.")
 elif not can_submit_order():
     st.warning(f"Order cooldown active. Next order in {int(cooldown_remaining())} seconds...")
-# SAFETY: Query actual Alpaca position before any sell
-    # Never sell more shares than actually held
-    actual_held_qty = 0
-    if current_ticker:
-        try:
-            actual_pos = trading_client.get_open_position(current_ticker)
-            actual_held_qty = float(actual_pos.qty)
-        except Exception:
-            actual_held_qty = 0
+
 # --- SELL EXECUTION ---
-if market_is_open():
+if market_is_open() and not PAUSED:
     for symbol, sig_data in signals.items():
-        if sig_data["signal"] == "SELL_LIQUIDATE" and current_ticker == symbol and total_qty > 0:
+        if sig_data["signal"] == "SELL_LIQUIDATE" and current_ticker == symbol and actual_held_qty > 0:
             if not can_submit_order() or symbol in pending_symbols:
                 continue
             try:
-                sell_order = MarketOrderRequest(symbol=symbol, qty=min(total_qty, actual_held_qty), side=OrderSide.SELL,
+                sell_order = MarketOrderRequest(symbol=symbol, qty=actual_held_qty, side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY, client_order_id=f"ACT_{uuid.uuid4().hex[:8]}")
                 trading_client.submit_order(order_data=sell_order)
                 mark_order_submitted()
-                st.success(f"Liquidated ALL {int(total_qty)} shares of {symbol} (blackout).")
+                st.success(f"Liquidated ALL {int(actual_held_qty)} shares of {symbol} (blackout).")
             except Exception as e:
                 st.error(f"Blackout liquidation failed: {e}")
 
     if patient_sell and current_ticker and patient_qty > 0:
-        if can_submit_order() and current_ticker not in pending_symbols:
+        safe_qty = min(patient_qty, actual_held_qty)
+        if safe_qty > 0 and can_submit_order() and current_ticker not in pending_symbols:
             try:
-                sell_order = MarketOrderRequest(symbol=current_ticker, qty=min(patient_qty, actual_held_qty), side=OrderSide.SELL,
+                sell_order = MarketOrderRequest(symbol=current_ticker, qty=safe_qty, side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY, client_order_id=f"PAT_{uuid.uuid4().hex[:8]}")
                 trading_client.submit_order(order_data=sell_order)
                 mark_order_submitted()
-                st.success(f"PATIENT SELL: {int(patient_qty)} shares of {current_ticker}. {patient_sell_reason}")
+                st.success(f"PATIENT SELL: {int(safe_qty)} shares of {current_ticker}. {patient_sell_reason}")
             except Exception as e:
                 st.error(f"Patient sell failed: {e}")
 
     if active_sell and current_ticker and active_qty > 0:
-        if can_submit_order() and current_ticker not in pending_symbols:
+        safe_qty = min(active_qty, actual_held_qty)
+        if safe_qty > 0 and can_submit_order() and current_ticker not in pending_symbols:
             try:
-                sell_order = MarketOrderRequest(symbol=current_ticker, qty=min(active_qty, actual_held_qty), side=OrderSide.SELL,
+                sell_order = MarketOrderRequest(symbol=current_ticker, qty=safe_qty, side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY, client_order_id=f"ACT_{uuid.uuid4().hex[:8]}")
                 trading_client.submit_order(order_data=sell_order)
                 mark_order_submitted()
-                st.success(f"ACTIVE SELL: {int(active_qty)} shares of {current_ticker}. {active_sell_reason}")
+                st.success(f"ACTIVE SELL: {int(safe_qty)} shares of {current_ticker}. {active_sell_reason}")
             except Exception as e:
                 st.error(f"Active sell failed: {e}")
 
