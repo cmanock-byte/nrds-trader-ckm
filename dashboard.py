@@ -382,15 +382,13 @@ if buy_candidate and remaining_budget <= 0:
     buy_candidate = None
 
 # Show cooldown or market closed status
-if PAUSED:
-    st.error("BOT PAUSED - Flip the toggle to resume.")
-elif not market_is_open():
+if not market_is_open():
     st.info("Market closed. Bot is monitoring only - no orders will be submitted.")
 elif not can_submit_order():
     st.warning(f"Order cooldown active. Next order in {int(cooldown_remaining())} seconds...")
 
 # --- SELL EXECUTION ---
-if market_is_open() and not PAUSED:
+if market_is_open():
     for symbol, sig_data in signals.items():
         if sig_data["signal"] == "SELL_LIQUIDATE" and current_ticker == symbol and total_qty > 0:
             if not can_submit_order() or symbol in pending_symbols:
