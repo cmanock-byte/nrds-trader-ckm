@@ -236,8 +236,9 @@ try:
                 active_qty = alpaca_qty
                 active_entry = alpaca_entry
                 total_qty = alpaca_qty
-            elif current_ticker == alpaca_symbol and alpaca_qty > total_qty:
-                active_qty = alpaca_qty - patient_qty
+            elif current_ticker == alpaca_symbol:
+                patient_qty = min(patient_qty, alpaca_qty)
+                active_qty = max(0, alpaca_qty - patient_qty)
                 if active_qty > 0 and active_entry == 0:
                     active_entry = alpaca_entry
                 total_qty = alpaca_qty
@@ -386,7 +387,15 @@ if not market_is_open():
     st.info("Market closed. Bot is monitoring only - no orders will be submitted.")
 elif not can_submit_order():
     st.warning(f"Order cooldown active. Next order in {int(cooldown_remaining())} seconds...")
-
+# SAFETY: Query actual Alpaca position before any sell
+    # Never sell more shares than actually held
+    actual_held_qty = 0
+    if current_ticker:
+        try:
+            actual_pos = trading_client.get_open_position(current_ticker)
+            actual_held_qty = float(actual_pos.qty)
+        except Exception:
+            actual_held_qty = 0
 # --- SELL EXECUTION ---
 if market_is_open():
     for symbol, sig_data in signals.items():
@@ -394,7 +403,7 @@ if market_is_open():
             if not can_submit_order() or symbol in pending_symbols:
                 continue
             try:
-                sell_order = MarketOrderRequest(symbol=symbol, qty=total_qty, side=OrderSide.SELL,
+                sell_order = MarketOrderRequest(symbol=symbol, qty=min(total_qty, actual_held_qty), side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY, client_order_id=f"ACT_{uuid.uuid4().hex[:8]}")
                 trading_client.submit_order(order_data=sell_order)
                 mark_order_submitted()
@@ -405,7 +414,7 @@ if market_is_open():
     if patient_sell and current_ticker and patient_qty > 0:
         if can_submit_order() and current_ticker not in pending_symbols:
             try:
-                sell_order = MarketOrderRequest(symbol=current_ticker, qty=patient_qty, side=OrderSide.SELL,
+                sell_order = MarketOrderRequest(symbol=current_ticker, qty=min(patient_qty, actual_held_qty), side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY, client_order_id=f"PAT_{uuid.uuid4().hex[:8]}")
                 trading_client.submit_order(order_data=sell_order)
                 mark_order_submitted()
@@ -416,7 +425,7 @@ if market_is_open():
     if active_sell and current_ticker and active_qty > 0:
         if can_submit_order() and current_ticker not in pending_symbols:
             try:
-                sell_order = MarketOrderRequest(symbol=current_ticker, qty=active_qty, side=OrderSide.SELL,
+                sell_order = MarketOrderRequest(symbol=current_ticker, qty=min(active_qty, actual_held_qty), side=OrderSide.SELL,
                     time_in_force=TimeInForce.DAY, client_order_id=f"ACT_{uuid.uuid4().hex[:8]}")
                 trading_client.submit_order(order_data=sell_order)
                 mark_order_submitted()
