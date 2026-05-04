@@ -36,6 +36,12 @@ if PAPER_MODE:
     st.success("PAPER TRADING MODE - No real money at risk.")
 else:
     st.error("LIVE TRADING MODE - Real money. Real consequences.")
+if "paused" not in st.session_state:
+    st.session_state["paused"] = False
+PAUSED = st.toggle("Pause Bot", value=st.session_state["paused"])
+st.session_state["paused"] = PAUSED
+if PAUSED:
+    st.error("BOT PAUSED - Flip the toggle to resume.")
 
 # --- 60-Second Order Cooldown (Race Condition Fix) ---
 # After ANY order, block all new orders for 60 seconds.
@@ -376,13 +382,15 @@ if buy_candidate and remaining_budget <= 0:
     buy_candidate = None
 
 # Show cooldown or market closed status
-if not market_is_open():
+if PAUSED:
+    st.error("BOT PAUSED - Flip the toggle to resume.")
+elif not market_is_open():
     st.info("Market closed. Bot is monitoring only - no orders will be submitted.")
 elif not can_submit_order():
     st.warning(f"Order cooldown active. Next order in {int(cooldown_remaining())} seconds...")
 
 # --- SELL EXECUTION ---
-if market_is_open():
+if market_is_open() and not PAUSED:
     for symbol, sig_data in signals.items():
         if sig_data["signal"] == "SELL_LIQUIDATE" and current_ticker == symbol and total_qty > 0:
             if not can_submit_order() or symbol in pending_symbols:
